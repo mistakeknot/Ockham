@@ -18,12 +18,16 @@ Ockham (governor)
 
 ## Package Map
 
-| Package | Purpose | Key Types |
-|---------|---------|-----------|
-| `intent` | Theme budgets, priority overrides | `Directive`, `ThemeBudget`, `IntentStore` |
-| `authority` | Trust tiers, domain grants | `Authority`, `DomainGrant`, `DelegationCeiling` |
-| `anomaly` | Algedonic signals, circuit breakers | `Signal`, `Detector`, `CircuitBreaker` |
-| `dispatch` | Weight synthesis | `Scorer`, `WeightConfig`, `DispatchAdvice` |
+| Package | Purpose | Key Types | Wave |
+|---------|---------|-----------|------|
+| `halt` | Factory halt sentinel (INV-8) | `Sentinel` | 1 |
+| `intent` | Theme budgets, YAML read/write/validate | `IntentFile`, `ThemeBudget`, `IntentVector`, `Priority`, `Store` | 1 |
+| `authority` | Trust tiers, domain grants | `State` (stub) | 3 |
+| `anomaly` | Algedonic signals, circuit breakers | `State` (stub) | 2 |
+| `scoring` | Weight synthesis, offset clamping | `BeadInfo`, `WeightVector`, `Score()` | 1 |
+| `governor` | Subsystem assembly, halt-first evaluation | `Governor`, `Evaluate()` | 1 |
+
+Dependency direction: `halt` imports nothing. `intent` imports nothing (uses yaml.v3). `authority`/`anomaly` import nothing. `scoring` imports `intent`, `authority`, `anomaly`. `governor` imports all five.
 
 ## Core Concepts
 
@@ -61,16 +65,24 @@ go test ./... -count=1
 go vet ./...
 ```
 
-## CLI (planned)
+## CLI
 
+**Implemented (Wave 1):**
 ```bash
-ockham intent --theme auth --budget 40%
-ockham intent --freeze non-critical
-ockham authority grant agent-3 --domain "core/*"
-ockham authority tier agent-3 --level supervised
-ockham anomaly --since 1h
-ockham health
-ockham dispatch advise   # show what would be dispatched next
+ockham intent --theme auth --budget 0.4 --priority high   # set theme
+ockham intent --freeze auth                                 # freeze a theme
+ockham intent show                                          # display table
+ockham intent validate                                      # check consistency
+ockham dispatch advise --json                               # weight vector output
+```
+
+**Planned (Wave 2-3):**
+```bash
+ockham authority show --json     # ratchet state per domain
+ockham anomaly --since 1h        # signal history
+ockham health --json              # factory health dashboard
+ockham check                      # signal evaluation
+ockham resume                     # clear halt sentinel
 ```
 
 ## Dependencies
