@@ -9,5 +9,6 @@ type BeadInfo struct {
 
 // WeightVector maps bead ID → additive offset for dispatch scoring.
 type WeightVector struct {
-	Offsets map[string]int
+	Offsets    map[string]int // final offsets (intent + advisory, clamped)
+	RawOffsets map[string]int // intent-only offsets (for dual logging)
 }

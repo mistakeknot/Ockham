@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 const schema = `
 CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL);
@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS ratchet_state (
     demoted_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (agent, domain)
 );
+CREATE TABLE IF NOT EXISTS bead_metrics (
+    bead_id TEXT PRIMARY KEY,
+    theme TEXT NOT NULL,
+    cycle_time_ms INTEGER NOT NULL,
+    pass_first_attempt INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    completed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bead_metrics_theme_completed
+    ON bead_metrics(theme, completed_at DESC);
 `
 
 // DB wraps a SQLite connection to signals.db.
@@ -170,12 +180,23 @@ func (db *DB) ensureSchema() error {
 }
 
 func (db *DB) migrateSchema(fromVersion int) error {
-	// Wave 1: only version 1 exists. Future migrations go here.
-	// Example for version 2:
-	//   if fromVersion < 2 {
-	//       db.conn.Exec("ALTER TABLE ratchet_state ADD COLUMN ...")
-	//   }
-	_ = fromVersion
+	if fromVersion < 2 {
+		_, err := db.conn.Exec(`
+			CREATE TABLE IF NOT EXISTS bead_metrics (
+				bead_id TEXT PRIMARY KEY,
+				theme TEXT NOT NULL,
+				cycle_time_ms INTEGER NOT NULL,
+				pass_first_attempt INTEGER NOT NULL DEFAULT 0,
+				cost_usd REAL,
+				completed_at INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_bead_metrics_theme_completed
+				ON bead_metrics(theme, completed_at DESC);
+		`)
+		if err != nil {
+			return fmt.Errorf("migrate v1→v2: %w", err)
+		}
+	}
 	_, err := db.conn.Exec("UPDATE schema_meta SET version = ?", currentSchemaVersion)
 	return err
 }

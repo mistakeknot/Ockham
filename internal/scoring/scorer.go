@@ -15,8 +15,11 @@ const (
 
 // Score computes per-bead weight offsets from intent, authority, and anomaly state.
 // Dependency direction: scoring imports intent, authority, anomaly. Governor imports all.
-func Score(iv intent.IntentVector, _ authority.State, _ anomaly.State, beads []BeadInfo) WeightVector {
-	wv := WeightVector{Offsets: make(map[string]int, len(beads))}
+func Score(iv intent.IntentVector, _ authority.State, an anomaly.State, beads []BeadInfo) WeightVector {
+	wv := WeightVector{
+		Offsets:    make(map[string]int, len(beads)),
+		RawOffsets: make(map[string]int, len(beads)),
+	}
 
 	for _, b := range beads {
 		lane := b.Lane
@@ -24,12 +27,23 @@ func Score(iv intent.IntentVector, _ authority.State, _ anomaly.State, beads []B
 			lane = "open"
 		}
 
-		offset, ok := iv.Offsets[lane]
+		intentOffset, ok := iv.Offsets[lane]
 		if !ok {
-			offset = 0 // unknown theme → neutral
+			intentOffset = 0 // unknown theme → neutral
 		}
 
-		wv.Offsets[b.ID] = clamp(offset, OffsetMin, OffsetMax)
+		rawOffset := clamp(intentOffset, OffsetMin, OffsetMax)
+		wv.RawOffsets[b.ID] = rawOffset
+
+		// Apply anomaly advisory offset (nil-safe: zero value if map is nil or key missing)
+		advisory := 0
+		if an.Signals != nil {
+			if sig, ok := an.Signals[lane]; ok {
+				advisory = sig.AdvisoryOffset
+			}
+		}
+
+		wv.Offsets[b.ID] = clamp(intentOffset+advisory, OffsetMin, OffsetMax)
 	}
 
 	return wv

@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/mistakeknot/Ockham/internal/anomaly"
 	"github.com/mistakeknot/Ockham/internal/halt"
 	"github.com/mistakeknot/Ockham/internal/signals"
 	"github.com/spf13/cobra"
@@ -54,12 +57,17 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "ockham: authority snapshot degraded: %v\n", err)
 	}
 
-	// Step 2: Reconstruct halt sentinel if needed
+	// Step 2: Evaluate INFORM signals and pleasure signals
+	if err := runner.evaluateSignals(); err != nil {
+		fmt.Fprintf(os.Stderr, "ockham: signal evaluation degraded: %v\n", err)
+	}
+
+	// Step 3: Reconstruct halt sentinel if needed
 	if err := runner.reconstructHalt(); err != nil {
 		fmt.Fprintf(os.Stderr, "ockham: halt reconstruction degraded: %v\n", err)
 	}
 
-	// Step 3: Check re-confirmation timers
+	// Step 4: Check re-confirmation timers
 	if err := runner.checkReconfirmation(); err != nil {
 		fmt.Fprintf(os.Stderr, "ockham: reconfirmation check degraded: %v\n", err)
 	}
@@ -69,6 +77,158 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// evaluateSignals runs INFORM signal evaluation and pleasure signal computation.
+func (r *CheckRunner) evaluateSignals() error {
+	if r.dryRun {
+		fmt.Println("ockham check: would evaluate signals (dry-run)")
+		return nil
+	}
+
+	// Ingest new bead metrics from bd
+	if err := r.ingestBeadMetrics(); err != nil {
+		fmt.Fprintf(os.Stderr, "ockham: bead ingest degraded: %v\n", err)
+		// Continue — evaluation will short-circuit on themes with no new data
+	}
+
+	// Discover themes: union of bead_metrics themes and existing signal_state keys
+	themes, err := r.discoverThemes()
+	if err != nil {
+		return fmt.Errorf("discover themes: %w", err)
+	}
+	if len(themes) == 0 {
+		return nil // no themes to evaluate
+	}
+
+	cfg := anomaly.DefaultConfig()
+	eval := anomaly.NewEvaluator(r.db, cfg)
+	now := time.Now().Unix()
+
+	state, err := eval.Evaluate(themes, now)
+	if err != nil {
+		return fmt.Errorf("evaluate: %w", err)
+	}
+
+	// Report signal states
+	for theme, sig := range state.Signals {
+		if sig.Status == anomaly.StatusFired {
+			fmt.Printf("  INFORM fired: theme=%s drift=%.1f%% advisory=%+d\n",
+				theme, sig.DriftPct*100, sig.AdvisoryOffset)
+		}
+	}
+
+	_ = state // pleasure signals are persisted by the evaluator
+	return nil
+}
+
+// ingestBeadMetrics shells out to bd to get recently closed beads and inserts metrics.
+func (r *CheckRunner) ingestBeadMetrics() error {
+	beads, err := closedBeadsFromBD()
+	if err != nil {
+		return err
+	}
+	for _, b := range beads {
+		if err := r.db.InsertBeadMetric(b); err != nil {
+			return fmt.Errorf("insert %s: %w", b.BeadID, err)
+		}
+	}
+	return nil
+}
+
+// discoverThemes returns the union of: bead_metrics themes + signal_state inform:* themes.
+func (r *CheckRunner) discoverThemes() ([]string, error) {
+	themeSet := make(map[string]bool)
+
+	// From bead_metrics
+	dbThemes, err := r.db.DistinctThemes()
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range dbThemes {
+		themeSet[t] = true
+	}
+
+	// From signal_state (keys matching "inform:*")
+	rows, err := r.db.Conn().Query("SELECT key FROM signal_state WHERE key LIKE 'inform:%'")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		theme := strings.TrimPrefix(key, "inform:")
+		themeSet[theme] = true
+	}
+
+	themes := make([]string, 0, len(themeSet))
+	for t := range themeSet {
+		themes = append(themes, t)
+	}
+	return themes, nil
+}
+
+// closedBeadsFromBD shells out to bd to get recently closed beads with metrics.
+// Limits to 100 most recent to avoid growing ingestion latency (P1 fix).
+func closedBeadsFromBD() ([]signals.BeadMetric, error) {
+	cmd := newBDCommand("list", "--status=closed", "--json", "--limit=100")
+	out, err := cmd.Output()
+	if err != nil {
+		// bd may not support --limit; fall back without it
+		cmd = newBDCommand("list", "--status=closed", "--json")
+		out, err = cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("bd list --status=closed: %w", err)
+		}
+	}
+
+	var beads []struct {
+		ID        string   `json:"id"`
+		Labels    []string `json:"labels"`
+		CreatedAt string   `json:"created_at"`
+		UpdatedAt string   `json:"updated_at"`
+	}
+	if err := json.Unmarshal(out, &beads); err != nil {
+		return nil, fmt.Errorf("parsing bd output: %w", err)
+	}
+
+	var metrics []signals.BeadMetric
+	for _, b := range beads {
+		lane := ""
+		for _, label := range b.Labels {
+			if strings.HasPrefix(label, "lane:") {
+				lane = strings.TrimPrefix(label, "lane:")
+				break
+			}
+		}
+		if lane == "" {
+			lane = "open"
+		}
+
+		created, errC := time.Parse(time.RFC3339, b.CreatedAt)
+		updated, errU := time.Parse(time.RFC3339, b.UpdatedAt)
+		if errC != nil || errU != nil || created.IsZero() || updated.IsZero() {
+			continue // skip beads with unparseable timestamps rather than poisoning baseline
+		}
+
+		cycleMs := updated.Sub(created).Milliseconds()
+
+		metrics = append(metrics, signals.BeadMetric{
+			BeadID:      b.ID,
+			Theme:       lane,
+			CycleTimeMs: cycleMs,
+			CompletedAt: updated.Unix(),
+		})
+	}
+	return metrics, nil
+}
+
+// newBDCommand creates an exec.Command for bd. Extracted for testability.
+func newBDCommand(args ...string) *exec.Cmd {
+	return exec.Command("bd", args...)
 }
 
 // snapshotAuthority reads interspect confidence.json and persists snapshots.

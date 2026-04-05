@@ -105,6 +105,62 @@ func TestScore_EmptyBeads(t *testing.T) {
 	}
 }
 
+func TestScore_AdvisoryOffsetApplied(t *testing.T) {
+	iv := intent.IntentVector{
+		Offsets:     map[string]int{"auth": 6},
+		Budgets:     map[string]float64{"auth": 1.0},
+		FrozenLanes: map[string]bool{},
+	}
+	an := anomaly.State{
+		Signals: map[string]anomaly.ThemeSignal{
+			"auth": {Theme: "auth", AdvisoryOffset: -1},
+		},
+	}
+	beads := []scoring.BeadInfo{{ID: "b1", Lane: "auth"}}
+	wv := scoring.Score(iv, authority.State{}, an, beads)
+
+	if wv.Offsets["b1"] != 5 {
+		t.Errorf("final offset = %d, want 5 (6 intent + -1 advisory)", wv.Offsets["b1"])
+	}
+	if wv.RawOffsets["b1"] != 6 {
+		t.Errorf("raw offset = %d, want 6 (intent only)", wv.RawOffsets["b1"])
+	}
+}
+
+func TestScore_AdvisoryClamped(t *testing.T) {
+	iv := intent.IntentVector{
+		Offsets:     map[string]int{"x": -3},
+		Budgets:     map[string]float64{"x": 1.0},
+		FrozenLanes: map[string]bool{},
+	}
+	an := anomaly.State{
+		Signals: map[string]anomaly.ThemeSignal{
+			"x": {Theme: "x", AdvisoryOffset: -5},
+		},
+	}
+	beads := []scoring.BeadInfo{{ID: "b1", Lane: "x"}}
+	wv := scoring.Score(iv, authority.State{}, an, beads)
+
+	if wv.Offsets["b1"] != -6 {
+		t.Errorf("offset = %d, want -6 (clamped: -3 + -5 = -8 → -6)", wv.Offsets["b1"])
+	}
+}
+
+func TestScore_NilAnomalyState(t *testing.T) {
+	iv := intent.IntentVector{
+		Offsets:     map[string]int{"auth": 6},
+		Budgets:     map[string]float64{"auth": 1.0},
+		FrozenLanes: map[string]bool{},
+	}
+	// Zero-value anomaly.State with nil Signals map — must not panic
+	beads := []scoring.BeadInfo{{ID: "b1", Lane: "auth"}}
+	wv := scoring.Score(iv, authority.State{}, anomaly.State{}, beads)
+
+	if wv.Offsets["b1"] != 6 {
+		t.Errorf("offset = %d, want 6 (no advisory)", wv.Offsets["b1"])
+	}
+}
+
 func TestScore_MultipleBeadsSameTheme(t *testing.T) {
 	iv := intent.IntentVector{
 		Offsets:     map[string]int{"auth": 6, "open": 0},
