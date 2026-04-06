@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -52,22 +53,35 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		dryRun:   checkDryRun,
 	}
 
-	// Step 1: Snapshot authority from interspect confidence.json
-	if err := runner.snapshotAuthority(); err != nil {
-		fmt.Fprintf(os.Stderr, "ockham: authority snapshot degraded: %v\n", err)
-	}
-
-	// Step 2: Evaluate INFORM signals and pleasure signals
-	if err := runner.evaluateSignals(); err != nil {
-		fmt.Fprintf(os.Stderr, "ockham: signal evaluation degraded: %v\n", err)
-	}
-
-	// Step 3: Reconstruct halt sentinel if needed
+	// Step 1: Reconstruct halt sentinel from interspect if needed (MUST be first)
 	if err := runner.reconstructHalt(); err != nil {
 		fmt.Fprintf(os.Stderr, "ockham: halt reconstruction degraded: %v\n", err)
 	}
 
-	// Step 4: Check re-confirmation timers
+	// Step 2: Check halt state — if halted, only snapshot authority then return
+	halted := halt.New(runner.haltPath).IsHalted()
+
+	// Step 3: Snapshot authority (always — read-only capture of external state)
+	if err := runner.snapshotAuthority(); err != nil {
+		fmt.Fprintf(os.Stderr, "ockham: authority snapshot degraded: %v\n", err)
+	}
+
+	if halted {
+		if !checkDryRun {
+			fmt.Fprintln(os.Stderr, "ockham check: factory halted — skipping signal evaluation and reconfirmation")
+		}
+		return nil
+	}
+
+	// Step 4: Evaluate INFORM signals and pleasure signals (only when not halted)
+	if err := runner.evaluateSignals(); err != nil {
+		if errors.Is(err, anomaly.ErrBypassFailed) {
+			return err // safety-critical: exit non-zero
+		}
+		fmt.Fprintf(os.Stderr, "ockham: signal evaluation degraded: %v\n", err)
+	}
+
+	// Step 5: Reconfirmation timers (only when not halted)
 	if err := runner.checkReconfirmation(); err != nil {
 		fmt.Fprintf(os.Stderr, "ockham: reconfirmation check degraded: %v\n", err)
 	}
@@ -309,6 +323,11 @@ func (r *CheckRunner) reconstructHalt() error {
 
 	// Only reconstruct if the record is active
 	if record.Status != "active" {
+		if record.Status == "resolved" {
+			if _, err := os.Stat(r.haltPath); err == nil {
+				fmt.Fprintf(os.Stderr, "ockham: halt-record.json resolved but %s still present — resume may have been interrupted; run 'ockham resume --confirm'\n", r.haltPath)
+			}
+		}
 		return nil
 	}
 
@@ -330,16 +349,22 @@ func (r *CheckRunner) reconstructHalt() error {
 	}
 	// Atomic create — O_EXCL prevents TOCTOU race where concurrent check
 	// or operator resume could conflict with this write.
-	f, err := os.OpenFile(r.haltPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	f, err := os.OpenFile(r.haltPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
 	if os.IsExist(err) {
 		return nil // sentinel already exists (concurrent reconstruction or operator action)
 	}
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.Write(sentinel)
-	return err
+	if _, err := f.Write(sentinel); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // checkReconfirmation flags autonomous domains past their 30-day window.

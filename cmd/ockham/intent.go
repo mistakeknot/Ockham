@@ -7,7 +7,6 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/mistakeknot/Ockham/internal/halt"
 	"github.com/mistakeknot/Ockham/internal/intent"
 	"github.com/spf13/cobra"
 )
@@ -48,18 +47,8 @@ func init() {
 	rootCmd.AddCommand(intentCmd)
 }
 
-func haltGuard() error {
-	h := halt.New(halt.DefaultSentinelPath())
-	if h.IsHalted() {
-		return fmt.Errorf("factory halted: %s exists — run 'ockham resume' first", h.Path())
-	}
-	return nil
-}
-
 func runIntentSet(cmd *cobra.Command, args []string) error {
-	if err := haltGuard(); err != nil {
-		return err
-	}
+	// Halt guard handled by PersistentPreRunE allowlist in root.go
 
 	store := intent.NewStore(intent.DefaultStorePath())
 

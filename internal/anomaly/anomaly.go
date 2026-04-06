@@ -1,5 +1,12 @@
 package anomaly
 
+import "errors"
+
+// ErrBypassFailed indicates the BYPASS trigger detected an emergency condition
+// but failed to write the sentinel file. This is a safety-critical error that
+// must NOT be swallowed by degraded-continue patterns.
+var ErrBypassFailed = errors.New("BYPASS trigger failed: sentinel write unsuccessful")
+
 // SignalStatus represents the state of an INFORM signal for a theme.
 type SignalStatus string
 

@@ -1,8 +1,11 @@
 package halt
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Sentinel checks factory halt state via a filesystem sentinel file.
@@ -33,4 +36,25 @@ func (s *Sentinel) IsHalted() bool {
 // Path returns the sentinel file path.
 func (s *Sentinel) Path() string {
 	return s.path
+}
+
+// RequireRunning returns an error if the factory is halted.
+// Reads factory-paused.json for context (reason, timestamp) when available.
+func (s *Sentinel) RequireRunning() error {
+	if !s.IsHalted() {
+		return nil
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return fmt.Errorf("factory halted: %s exists — run 'ockham resume --confirm' first", s.path)
+	}
+	var record struct {
+		Reason    string `json:"reason"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	if json.Unmarshal(data, &record) != nil || record.Reason == "" {
+		return fmt.Errorf("factory halted: %s exists — run 'ockham resume --confirm' first", s.path)
+	}
+	t := time.Unix(record.Timestamp, 0).Format(time.RFC3339)
+	return fmt.Errorf("factory halted since %s (reason: %s) — run 'ockham resume --confirm' first", t, record.Reason)
 }
