@@ -111,19 +111,20 @@ func runResume(cmd *cobra.Command, args []string) error {
 		_ = os.WriteFile(interspectPath, rd, 0644)
 	}
 
-	// 8. BEGIN IMMEDIATE ratchet_state reset
+	// 8. Ratchet_state reset in a proper transaction
 	conn := db.Conn()
-	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
-		return fmt.Errorf("begin immediate: %w", err)
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
 	}
-	_, err = conn.ExecContext(context.Background(),
+	_, err = tx.ExecContext(context.Background(),
 		"UPDATE ratchet_state SET tier='supervised', demoted_at=? WHERE tier='autonomous'",
 		time.Now().Unix())
 	if err != nil {
-		conn.ExecContext(context.Background(), "ROLLBACK")
+		tx.Rollback()
 		return fmt.Errorf("ratchet reset: %w", err)
 	}
-	if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
 

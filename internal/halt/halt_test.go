@@ -3,6 +3,7 @@ package halt_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mistakeknot/Ockham/internal/halt"
@@ -55,10 +56,10 @@ func TestRequireRunning_HaltedWithContext(t *testing.T) {
 		t.Fatal("expected error when halted")
 	}
 	s := err.Error()
-	if !contains(s, "BYPASS") {
+	if !strings.Contains(s, "BYPASS") {
 		t.Errorf("expected reason in error, got %q", s)
 	}
-	if !contains(s, "resume --confirm") {
+	if !strings.Contains(s, "resume --confirm") {
 		t.Errorf("expected resume hint in error, got %q", s)
 	}
 }
@@ -74,20 +75,8 @@ func TestRequireRunning_HaltedInvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when halted with invalid JSON")
 	}
-	if !contains(err.Error(), "resume") {
+	if !strings.Contains(err.Error(), "resume") {
 		t.Errorf("expected fallback message, got %q", err.Error())
 	}
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}

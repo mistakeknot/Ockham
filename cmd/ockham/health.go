@@ -99,7 +99,7 @@ func runHealth(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Commit()
+	defer tx.Rollback()
 
 	cfg := anomaly.DefaultConfig()
 
@@ -128,6 +128,9 @@ func runHealth(cmd *cobra.Command, args []string) error {
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
 	// Read pleasure signals
 	rows, err = tx.Query("SELECT key, value FROM signal_state WHERE key LIKE 'pleasure:%'")
@@ -150,6 +153,9 @@ func runHealth(cmd *cobra.Command, args []string) error {
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
 	// last_check = MAX(updated_at) from signal_state
 	var lastCheck *int64
@@ -169,6 +175,9 @@ func runHealth(cmd *cobra.Command, args []string) error {
 		output.Themes = append(output.Themes, t)
 	}
 	themeRows.Close()
+	if err := themeRows.Err(); err != nil {
+		return err
+	}
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
