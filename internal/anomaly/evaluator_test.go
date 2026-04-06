@@ -1,6 +1,10 @@
 package anomaly_test
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -155,5 +159,122 @@ func TestEvaluator_PleasureSignals(t *testing.T) {
 		if !names[expected] {
 			t.Errorf("missing pleasure signal: %s", expected)
 		}
+	}
+}
+
+func makeBypassDB(t *testing.T, dir string) *signals.DB {
+	t.Helper()
+	db, err := signals.NewDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func insertDriftMetrics(t *testing.T, db *signals.DB, theme string, count int, driftHalf bool) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		cycle := int64(1000)
+		if driftHalf && i >= count/2 {
+			cycle = 1300 // 30% drift
+		}
+		db.InsertBeadMetric(signals.BeadMetric{
+			BeadID:      fmt.Sprintf("%s-%d", theme, i),
+			Theme:       theme,
+			CycleTimeMs: cycle,
+			CompletedAt: int64(i + 1),
+		})
+	}
+}
+
+func TestEvaluator_BypassNotTriggered_OneFired(t *testing.T) {
+	dir := t.TempDir()
+	db := makeBypassDB(t, dir)
+	sentinelPath := filepath.Join(dir, "factory-paused.json")
+
+	insertDriftMetrics(t, db, "auth", 20, true)  // 30% drift — will fire
+	insertDriftMetrics(t, db, "perf", 20, false)  // no drift — won't fire
+
+	cfg := anomaly.DefaultConfig()
+	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+
+	_, err := eval.Evaluate([]string{"auth", "perf"}, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sentinelPath); err == nil {
+		t.Error("sentinel should not exist with only 1 fired theme")
+	}
+}
+
+func TestEvaluator_BypassTriggered_TwoFired(t *testing.T) {
+	dir := t.TempDir()
+	db := makeBypassDB(t, dir)
+	sentinelPath := filepath.Join(dir, "factory-paused.json")
+
+	insertDriftMetrics(t, db, "auth", 20, true)
+	insertDriftMetrics(t, db, "perf", 20, true)
+
+	cfg := anomaly.DefaultConfig()
+	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+
+	_, err := eval.Evaluate([]string{"auth", "perf"}, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sentinelPath); os.IsNotExist(err) {
+		t.Error("sentinel should exist after BYPASS trigger")
+	}
+	data, err := os.ReadFile(sentinelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("sentinel JSON invalid: %v", err)
+	}
+	if record["code"] != "bypass_multi_root_cause" {
+		t.Errorf("expected bypass_multi_root_cause, got %v", record["code"])
+	}
+}
+
+func TestEvaluator_BypassSentinelAlreadyExists(t *testing.T) {
+	dir := t.TempDir()
+	db := makeBypassDB(t, dir)
+	sentinelPath := filepath.Join(dir, "factory-paused.json")
+
+	os.WriteFile(sentinelPath, []byte(`{"reason":"prior"}`), 0644)
+
+	insertDriftMetrics(t, db, "t1", 20, true)
+	insertDriftMetrics(t, db, "t2", 20, true)
+
+	cfg := anomaly.DefaultConfig()
+	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+
+	_, err := eval.Evaluate([]string{"t1", "t2"}, 500)
+	if err != nil {
+		t.Fatalf("expected no error with existing sentinel, got %v", err)
+	}
+}
+
+func TestEvaluator_ErrBypassFailed_PropagatesTyped(t *testing.T) {
+	dir := t.TempDir()
+	db := makeBypassDB(t, dir)
+	sentinelPath := filepath.Join(dir, "nonexistent-readonly", "sub", "factory-paused.json")
+	os.MkdirAll(filepath.Join(dir, "nonexistent-readonly"), 0555)
+
+	insertDriftMetrics(t, db, "t1", 20, true)
+	insertDriftMetrics(t, db, "t2", 20, true)
+
+	cfg := anomaly.DefaultConfig()
+	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+
+	_, err := eval.Evaluate([]string{"t1", "t2"}, 500)
+	if err == nil {
+		t.Fatal("expected ErrBypassFailed")
+	}
+	if !errors.Is(err, anomaly.ErrBypassFailed) {
+		t.Errorf("expected ErrBypassFailed, got %v", err)
 	}
 }

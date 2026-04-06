@@ -4,24 +4,38 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/mistakeknot/Ockham/internal/halt"
 	"github.com/mistakeknot/Ockham/internal/signals"
 )
 
 // Evaluator orchestrates signal evaluation across all themes.
 type Evaluator struct {
-	db  *signals.DB
-	cfg Config
+	db           *signals.DB
+	cfg          Config
+	sentinelPath string // path to factory-paused.json; testable via NewEvaluator
 }
 
 // NewEvaluator creates an Evaluator with the given DB and config.
-func NewEvaluator(db *signals.DB, cfg Config) *Evaluator {
-	return &Evaluator{db: db, cfg: cfg}
+// sentinelPath overrides the default halt sentinel path (pass "" for default).
+func NewEvaluator(db *signals.DB, cfg Config, sentinelPath ...string) *Evaluator {
+	sp := halt.DefaultSentinelPath()
+	if len(sentinelPath) > 0 && sentinelPath[0] != "" {
+		sp = sentinelPath[0]
+	}
+	return &Evaluator{db: db, cfg: cfg, sentinelPath: sp}
 }
 
 // Evaluate runs drift detection and pleasure signals for all themes.
 // Returns the full State. Handles short-circuit, staleness, and degradation.
+// When >=BypassThreshold themes fire simultaneously, triggers BYPASS (factory halt).
 func (e *Evaluator) Evaluate(themes []string, now int64) (State, error) {
+	if err := e.cfg.Validate(); err != nil {
+		return State{}, err
+	}
+
 	state := State{
 		Signals:  make(map[string]ThemeSignal, len(themes)),
 		Pleasure: make([]PleasureSignal, 0, len(themes)*3),
@@ -99,7 +113,90 @@ func (e *Evaluator) Evaluate(themes []string, now int64) (State, error) {
 	// Factory guard
 	state.Signals = ApplyFactoryGuard(state.Signals, e.cfg.FactoryGuard)
 
+	// BYPASS trigger: count distinct fired themes
+	var firedThemes []string
+	for theme, sig := range state.Signals {
+		if sig.Status == StatusFired {
+			firedThemes = append(firedThemes, theme)
+		}
+	}
+	if len(firedThemes) >= e.cfg.BypassThreshold {
+		if err := e.triggerBypass(firedThemes, state, now); err != nil {
+			return state, fmt.Errorf("%w: %v", ErrBypassFailed, err)
+		}
+	}
+
 	return state, nil
+}
+
+// triggerBypass writes the factory halt sentinel and interspect record.
+// Sentinel write is atomic + durable (temp + fsync + rename).
+// Interspect write is soft failure — never rolls back sentinel.
+func (e *Evaluator) triggerBypass(firedThemes []string, state State, now int64) error {
+	record := map[string]any{
+		"reason":           "BYPASS",
+		"code":             "bypass_multi_root_cause",
+		"triggered_themes": firedThemes,
+		"signal_values":    state.Signals,
+		"timestamp":        now,
+		"schema_version":   1,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+
+	// Step 1: Atomic durable sentinel write (temp + fsync + rename)
+	dir := filepath.Dir(e.sentinelPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".factory-paused-*.json")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // cleanup temp on any failure path
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0400); err != nil {
+		return err
+	}
+	// Atomic rename — if sentinel already exists (concurrent BYPASS), overwrites
+	// which is acceptable (halt is already active with same or similar reason).
+	if err := os.Rename(tmpPath, e.sentinelPath); err != nil {
+		return err
+	}
+
+	// Step 2: Write interspect halt record (soft failure — NEVER roll back sentinel)
+	interspectPath := filepath.Join(os.Getenv("HOME"), ".clavain", "interspect", "halt-record.json")
+	interspectRecord := map[string]any{
+		"event_id":         fmt.Sprintf("bypass-%d", now),
+		"timestamp":        now,
+		"reason":           fmt.Sprintf("BYPASS: %d distinct root causes fired: %s", len(firedThemes), strings.Join(firedThemes, ", ")),
+		"status":           "active",
+		"triggered_themes": firedThemes,
+	}
+	irData, _ := json.Marshal(interspectRecord)
+	if err := os.MkdirAll(filepath.Dir(interspectPath), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "ockham: interspect halt record degraded (mkdir): %v\n", err)
+	} else if err := os.WriteFile(interspectPath, irData, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "ockham: interspect halt record degraded (write): %v\n", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "ockham: BYPASS triggered — %d distinct root causes: %s\n",
+		len(firedThemes), strings.Join(firedThemes, ", "))
+	return nil
 }
 
 func (e *Evaluator) loadPriorSignal(theme string) ThemeSignal {

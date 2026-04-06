@@ -210,3 +210,22 @@ func TestMedianCycleTime(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_Validate_Valid(t *testing.T) {
+	cfg := DefaultConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected valid default config, got %v", err)
+	}
+}
+
+func TestConfig_Validate_BypassThresholdTooLow(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BypassThreshold = 1
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for bypass_threshold=1")
+	}
+	cfg.BypassThreshold = 0
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for bypass_threshold=0")
+	}
+}

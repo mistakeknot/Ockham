@@ -187,6 +187,13 @@ func (r *CheckRunner) discoverThemes() ([]string, error) {
 
 // closedBeadsFromBD shells out to bd to get recently closed beads with metrics.
 // Limits to 100 most recent to avoid growing ingestion latency (P1 fix).
+//
+// INVARIANT: Each bead maps to exactly one lane (first lane: label found).
+// This ensures bead populations are disjoint per-theme, which is required
+// for BYPASS root-cause deduplication (distinct_root_causes >= 2 means
+// distinct theme names, which is a valid proxy for causal independence
+// ONLY when bead populations are disjoint). If multi-lane beads are
+// introduced, BYPASS deduplication must be re-evaluated.
 func closedBeadsFromBD() ([]signals.BeadMetric, error) {
 	cmd := newBDCommand("list", "--status=closed", "--json", "--limit=100")
 	out, err := cmd.Output()

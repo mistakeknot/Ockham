@@ -1,6 +1,7 @@
 package anomaly
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/mistakeknot/Ockham/internal/signals"
@@ -16,6 +17,15 @@ type Config struct {
 	MaxAdvisoryPerCycle int     // rate limit: max offset reduction per theme per cycle (default 1)
 	FactoryGuard        int     // max sum of advisory reductions across all themes (default 12)
 	StaleDays           int     // days without new beads → stale (default 14)
+	BypassThreshold     int     // minimum distinct fired themes to trigger BYPASS (default 2, min 2)
+}
+
+// Validate checks config invariants. Called from NewEvaluator.
+func (c Config) Validate() error {
+	if c.BypassThreshold < 2 {
+		return fmt.Errorf("bypass_threshold must be >= 2: values below 2 cause immediate halt on any INFORM signal")
+	}
+	return nil
 }
 
 // DefaultConfig returns production defaults.
@@ -29,6 +39,7 @@ func DefaultConfig() Config {
 		MaxAdvisoryPerCycle: 1,
 		FactoryGuard:        12,
 		StaleDays:           14,
+		BypassThreshold:     2,
 	}
 }
 
