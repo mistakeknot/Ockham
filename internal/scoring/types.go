@@ -5,6 +5,8 @@ package scoring
 type BeadInfo struct {
 	ID   string
 	Lane string // empty → "open" theme
+	Org  string // github org
+	Repo string // repo name
 }
 
 // WeightVector maps bead ID → additive offset for dispatch scoring.

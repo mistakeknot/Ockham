@@ -13,6 +13,10 @@ import (
 var haltAllowed = map[string]bool{
 	"check": true, "health": true, "signals": true, "resume": true,
 	"intent show": true, "intent validate": true,
+	"config show": true, "config validate": true,
+	"discover": true, "discover scan": true,
+	"cost show": true, "cost check": true, "cost pending": true, "cost approve": true,
+	"route": true, "notify": true,
 	"help": true, "version": true,
 }
 
