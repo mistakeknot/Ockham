@@ -1,14 +1,17 @@
 package anomaly_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mistakeknot/Ockham/internal/anomaly"
+	"github.com/mistakeknot/Ockham/internal/observation"
 	"github.com/mistakeknot/Ockham/internal/signals"
 )
 
@@ -197,7 +200,7 @@ func TestEvaluator_BypassNotTriggered_OneFired(t *testing.T) {
 	insertDriftMetrics(t, db, "perf", 20, false)  // no drift — won't fire
 
 	cfg := anomaly.DefaultConfig()
-	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+	eval := anomaly.NewEvaluator(db, cfg, anomaly.WithSentinelPath(sentinelPath))
 
 	_, err := eval.Evaluate([]string{"auth", "perf"}, 500)
 	if err != nil {
@@ -217,7 +220,7 @@ func TestEvaluator_BypassTriggered_TwoFired(t *testing.T) {
 	insertDriftMetrics(t, db, "perf", 20, true)
 
 	cfg := anomaly.DefaultConfig()
-	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+	eval := anomaly.NewEvaluator(db, cfg, anomaly.WithSentinelPath(sentinelPath))
 
 	_, err := eval.Evaluate([]string{"auth", "perf"}, 500)
 	if err != nil {
@@ -250,7 +253,7 @@ func TestEvaluator_BypassSentinelAlreadyExists(t *testing.T) {
 	insertDriftMetrics(t, db, "t2", 20, true)
 
 	cfg := anomaly.DefaultConfig()
-	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+	eval := anomaly.NewEvaluator(db, cfg, anomaly.WithSentinelPath(sentinelPath))
 
 	_, err := eval.Evaluate([]string{"t1", "t2"}, 500)
 	if err != nil {
@@ -268,7 +271,7 @@ func TestEvaluator_ErrBypassFailed_PropagatesTyped(t *testing.T) {
 	insertDriftMetrics(t, db, "t2", 20, true)
 
 	cfg := anomaly.DefaultConfig()
-	eval := anomaly.NewEvaluator(db, cfg, sentinelPath)
+	eval := anomaly.NewEvaluator(db, cfg, anomaly.WithSentinelPath(sentinelPath))
 
 	_, err := eval.Evaluate([]string{"t1", "t2"}, 500)
 	if err == nil {
@@ -276,5 +279,152 @@ func TestEvaluator_ErrBypassFailed_PropagatesTyped(t *testing.T) {
 	}
 	if !errors.Is(err, anomaly.ErrBypassFailed) {
 		t.Errorf("expected ErrBypassFailed, got %v", err)
+	}
+}
+
+// testObserver implements observation.Observer for integration testing.
+type testObserver struct {
+	available bool
+	metrics   []observation.ObservationMetric
+}
+
+func (o *testObserver) IsAvailable() bool { return o.available }
+func (o *testObserver) Collect(_ context.Context, _ []string, _ time.Duration) ([]observation.ObservationMetric, error) {
+	return o.metrics, nil
+}
+
+func TestEvaluator_HighToolErrorRate_ElevatesINFORM(t *testing.T) {
+	eval, db := newTestEvaluator(t)
+	_ = eval // use the default evaluator for comparison
+
+	// Create evaluator with mock observer that reports high tool_error_rate
+	dir := t.TempDir()
+	db2, err := signals.NewDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	cfg := anomaly.DefaultConfig()
+	cfg.MinWindow = 4
+	cfg.MaxWindow = 10
+
+	obs := &testObserver{
+		available: true,
+		metrics: []observation.ObservationMetric{
+			{Theme: "auth", MetricType: "tool_error_rate", Value: 0.5, CollectedAt: 1000},
+		},
+	}
+	evalObs := anomaly.NewEvaluator(db2, cfg, anomaly.WithObserver(obs))
+
+	// Insert non-drifting metrics (would normally be cleared)
+	insertMetrics(t, db, "auth", []int64{1000, 1000, 1000, 1000}, nil)
+	for i, ct := range []int64{1000, 1000, 1000, 1000} {
+		db2.InsertBeadMetric(signals.BeadMetric{
+			BeadID:      "auth-" + string(rune(i+65)),
+			Theme:       "auth",
+			CycleTimeMs: ct,
+			CompletedAt: int64((4 - i) * 100),
+		})
+	}
+
+	// Without observer: should be cleared (no drift)
+	stateNoObs, err := eval.Evaluate([]string{"auth"}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateNoObs.Signals["auth"].Status != anomaly.StatusCleared {
+		t.Errorf("without observer: status = %q, want cleared", stateNoObs.Signals["auth"].Status)
+	}
+
+	// With high tool_error_rate observer: should be elevated to fired
+	stateObs, err := evalObs.Evaluate([]string{"auth"}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateObs.Signals["auth"].Status != anomaly.StatusFired {
+		t.Errorf("with high error rate observer: status = %q, want fired", stateObs.Signals["auth"].Status)
+	}
+}
+
+func TestEvaluator_NormalObserver_NoChange(t *testing.T) {
+	dir := t.TempDir()
+	db, err := signals.NewDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	cfg := anomaly.DefaultConfig()
+	cfg.MinWindow = 4
+	cfg.MaxWindow = 10
+
+	obs := &testObserver{
+		available: true,
+		metrics: []observation.ObservationMetric{
+			{Theme: "auth", MetricType: "tool_error_rate", Value: 0.1, CollectedAt: 1000},
+			{Theme: "auth", MetricType: "session_completion_rate", Value: 0.9, CollectedAt: 1000},
+		},
+	}
+	eval := anomaly.NewEvaluator(db, cfg, anomaly.WithObserver(obs))
+
+	for i, ct := range []int64{1000, 1000, 1000, 1000} {
+		db.InsertBeadMetric(signals.BeadMetric{
+			BeadID: "auth-" + string(rune(i+65)), Theme: "auth",
+			CycleTimeMs: ct, CompletedAt: int64((4 - i) * 100),
+		})
+	}
+
+	state, err := eval.Evaluate([]string{"auth"}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Signals["auth"].Status != anomaly.StatusCleared {
+		t.Errorf("normal rates should not change status: got %q", state.Signals["auth"].Status)
+	}
+}
+
+func TestEvaluator_WithoutObserver_Regression(t *testing.T) {
+	// Verify evaluator without observer produces identical output
+	eval, db := newTestEvaluator(t)
+	insertMetrics(t, db, "auth", []int64{1200, 1200, 1000, 1000}, nil)
+
+	state, err := eval.Evaluate([]string{"auth"}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Signals["auth"].Status != anomaly.StatusFired {
+		t.Errorf("regression: status = %q, want fired", state.Signals["auth"].Status)
+	}
+}
+
+func TestEvaluator_UnavailableObserver_IdenticalToNone(t *testing.T) {
+	dir := t.TempDir()
+	db, err := signals.NewDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	cfg := anomaly.DefaultConfig()
+	cfg.MinWindow = 4
+	cfg.MaxWindow = 10
+
+	obs := &testObserver{available: false}
+	eval := anomaly.NewEvaluator(db, cfg, anomaly.WithObserver(obs))
+
+	for i, ct := range []int64{1000, 1000, 1000, 1000} {
+		db.InsertBeadMetric(signals.BeadMetric{
+			BeadID: "auth-" + string(rune(i+65)), Theme: "auth",
+			CycleTimeMs: ct, CompletedAt: int64((4 - i) * 100),
+		})
+	}
+
+	state, err := eval.Evaluate([]string{"auth"}, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Signals["auth"].Status != anomaly.StatusCleared {
+		t.Errorf("unavailable observer: status = %q, want cleared", state.Signals["auth"].Status)
 	}
 }

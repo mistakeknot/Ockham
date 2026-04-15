@@ -26,6 +26,7 @@ internal/
   intent/              Intent directives (theme budgets, priority overrides)
   authority/           Authority tiers, domain grants, delegation ceiling
   anomaly/             Algedonic signals, anomaly detection, circuit breakers
+  observation/         Alwe/CASS observation bridge (ObservationMetric, Observer interface)
   dispatch/            Dispatch weight synthesis (intent + authority + state → scores)
 docs/
   vision.md            Vision and philosophy

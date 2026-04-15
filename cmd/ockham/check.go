@@ -12,6 +12,7 @@ import (
 
 	"github.com/mistakeknot/Ockham/internal/anomaly"
 	"github.com/mistakeknot/Ockham/internal/halt"
+	"github.com/mistakeknot/Ockham/internal/observation"
 	"github.com/mistakeknot/Ockham/internal/signals"
 	"github.com/spf13/cobra"
 )
@@ -116,7 +117,8 @@ func (r *CheckRunner) evaluateSignals() error {
 	}
 
 	cfg := anomaly.DefaultConfig()
-	eval := anomaly.NewEvaluator(r.db, cfg)
+	obs := observation.NewCassObserver()
+	eval := anomaly.NewEvaluator(r.db, cfg, anomaly.WithObserver(obs))
 	now := time.Now().Unix()
 
 	state, err := eval.Evaluate(themes, now)

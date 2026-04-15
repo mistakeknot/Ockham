@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mistakeknot/Ockham/internal/anomaly"
 	"github.com/mistakeknot/Ockham/internal/halt"
@@ -25,13 +26,21 @@ func init() {
 
 // HealthOutput is the JSON structure for factory health.
 type HealthOutput struct {
-	Halted        bool                      `json:"halted"`
-	HaltReason    *HaltReasonOutput         `json:"halt_reason"`
-	Signals       map[string]SignalOutput    `json:"signals"`
-	Pleasure      map[string]PleasureOutput  `json:"pleasure"`
-	Themes        []string                  `json:"themes"`
-	LastCheck     int64                     `json:"last_check"`
-	SchemaVersion int                       `json:"schema_version"`
+	Halted        bool                       `json:"halted"`
+	HaltReason    *HaltReasonOutput          `json:"halt_reason"`
+	Signals       map[string]SignalOutput     `json:"signals"`
+	Pleasure      map[string]PleasureOutput   `json:"pleasure"`
+	Observation   *ObservationHealthOutput    `json:"observation"`
+	Themes        []string                   `json:"themes"`
+	LastCheck     int64                      `json:"last_check"`
+	SchemaVersion int                        `json:"schema_version"`
+}
+
+// ObservationHealthOutput reports observation data availability.
+type ObservationHealthOutput struct {
+	Available   bool  `json:"available"`
+	LastCollect int64 `json:"last_collect,omitempty"`
+	MetricCount int   `json:"metric_count"`
 }
 
 // HaltReasonOutput is the structured halt reason.
@@ -71,7 +80,7 @@ func runHealth(cmd *cobra.Command, args []string) error {
 		Halted:        halted,
 		Signals:       make(map[string]SignalOutput),
 		Pleasure:      make(map[string]PleasureOutput),
-		SchemaVersion: 2,
+		SchemaVersion: 3,
 	}
 
 	// Read halt context if halted
@@ -162,6 +171,22 @@ func runHealth(cmd *cobra.Command, args []string) error {
 	tx.QueryRow("SELECT MAX(updated_at) FROM signal_state").Scan(&lastCheck)
 	if lastCheck != nil {
 		output.LastCheck = *lastCheck
+	}
+
+	// Observation stats
+	since24h := time.Now().Unix() - 24*3600
+	obsStats, err := db.GetObservationStats(since24h)
+	if err != nil {
+		// Degrade gracefully — observation is advisory
+		fmt.Fprintf(os.Stderr, "ockham: observation stats degraded: %v\n", err)
+	} else if obsStats.Available {
+		output.Observation = &ObservationHealthOutput{
+			Available:   true,
+			LastCollect: obsStats.LastCollect,
+			MetricCount: obsStats.MetricCount,
+		}
+	} else {
+		output.Observation = &ObservationHealthOutput{Available: false}
 	}
 
 	// Themes from bead_metrics

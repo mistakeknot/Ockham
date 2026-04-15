@@ -1,13 +1,16 @@
 package anomaly
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mistakeknot/Ockham/internal/halt"
+	"github.com/mistakeknot/Ockham/internal/observation"
 	"github.com/mistakeknot/Ockham/internal/signals"
 )
 
@@ -16,16 +19,39 @@ type Evaluator struct {
 	db           *signals.DB
 	cfg          Config
 	sentinelPath string // path to factory-paused.json; testable via NewEvaluator
+	observer     observation.Observer
+}
+
+// EvaluatorOption configures an Evaluator.
+type EvaluatorOption func(*Evaluator)
+
+// WithSentinelPath overrides the default halt sentinel path.
+func WithSentinelPath(path string) EvaluatorOption {
+	return func(e *Evaluator) {
+		if path != "" {
+			e.sentinelPath = path
+		}
+	}
+}
+
+// WithObserver attaches an observation source to the evaluator.
+func WithObserver(obs observation.Observer) EvaluatorOption {
+	return func(e *Evaluator) {
+		e.observer = obs
+	}
 }
 
 // NewEvaluator creates an Evaluator with the given DB and config.
-// sentinelPath overrides the default halt sentinel path (pass "" for default).
-func NewEvaluator(db *signals.DB, cfg Config, sentinelPath ...string) *Evaluator {
-	sp := halt.DefaultSentinelPath()
-	if len(sentinelPath) > 0 && sentinelPath[0] != "" {
-		sp = sentinelPath[0]
+func NewEvaluator(db *signals.DB, cfg Config, opts ...EvaluatorOption) *Evaluator {
+	e := &Evaluator{
+		db:           db,
+		cfg:          cfg,
+		sentinelPath: halt.DefaultSentinelPath(),
 	}
-	return &Evaluator{db: db, cfg: cfg, sentinelPath: sp}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // Evaluate runs drift detection and pleasure signals for all themes.
@@ -39,6 +65,25 @@ func (e *Evaluator) Evaluate(themes []string, now int64) (State, error) {
 	state := State{
 		Signals:  make(map[string]ThemeSignal, len(themes)),
 		Pleasure: make([]PleasureSignal, 0, len(themes)*3),
+	}
+
+	// Observation metrics: collect and persist
+	var obsMetrics []observation.ObservationMetric
+	loggedDegradation := false
+	if e.observer != nil {
+		if e.observer.IsAvailable() {
+			var err error
+			obsMetrics, err = e.observer.Collect(context.Background(), themes, 24*time.Hour)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ockham: observation collect degraded: %v\n", err)
+			}
+			for _, m := range obsMetrics {
+				e.db.InsertObservation(m.Theme, m.MetricType, m.Value, m.CollectedAt)
+			}
+		} else if !loggedDegradation {
+			fmt.Fprintf(os.Stderr, "ockham: Alwe observation degraded: CASS unavailable\n")
+			loggedDegradation = true
+		}
 	}
 
 	for _, theme := range themes {
@@ -85,6 +130,26 @@ func (e *Evaluator) Evaluate(themes []string, now int64) (State, error) {
 		signal.Theme = theme
 		signal.LastEvalAt = now
 
+		// Advisory: observation metrics can increase INFORM severity (not BYPASS)
+		for _, m := range obsMetrics {
+			if m.Theme != theme {
+				continue
+			}
+			elevate := false
+			if m.MetricType == "tool_error_rate" && m.Value > 0.3 {
+				elevate = true
+			}
+			if m.MetricType == "session_completion_rate" && m.Value < 0.5 {
+				elevate = true
+			}
+			if elevate && signal.Status != StatusFired {
+				signal.Status = StatusFired
+				if signal.AdvisoryOffset > -e.cfg.MaxAdvisoryPerCycle {
+					signal.AdvisoryOffset = -e.cfg.MaxAdvisoryPerCycle
+				}
+			}
+		}
+
 		// Log transitions
 		if signal.Status != prior.Status {
 			fmt.Fprintf(os.Stderr, "ockham: INFORM %s → %s for theme %q (drift=%.1f%%)\n",
@@ -107,6 +172,9 @@ func (e *Evaluator) Evaluate(themes []string, now int64) (State, error) {
 		// Prune old data
 		if _, err := e.db.PruneBeadMetrics(theme, e.cfg.MaxWindow*2); err != nil {
 			fmt.Fprintf(os.Stderr, "ockham: prune degraded for %q: %v\n", theme, err)
+		}
+		if _, err := e.db.PruneObservations(theme, e.cfg.MaxWindow*2); err != nil {
+			fmt.Fprintf(os.Stderr, "ockham: observation prune degraded for %q: %v\n", theme, err)
 		}
 	}
 
