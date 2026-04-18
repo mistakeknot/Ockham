@@ -28,8 +28,8 @@ func TestNewDB_CreatesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("schema version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("schema version = %d, want 4", version)
 	}
 }
 

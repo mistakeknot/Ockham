@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 const schema = `
 CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL);
@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS observation_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_obs_theme_type
     ON observation_metrics(theme, metric_type, collected_at DESC);
+CREATE TABLE IF NOT EXISTS constrain_state (
+    theme TEXT PRIMARY KEY,
+    reason TEXT NOT NULL DEFAULT '',
+    fast_path INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    until_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_constrain_until
+    ON constrain_state(until_at);
 `
 
 // DB wraps a SQLite connection to signals.db.
@@ -220,6 +229,22 @@ func (db *DB) migrateSchema(fromVersion int) error {
 		`)
 		if err != nil {
 			return fmt.Errorf("migrate v2→v3: %w", err)
+		}
+	}
+	if fromVersion < 4 {
+		_, err := db.conn.Exec(`
+			CREATE TABLE IF NOT EXISTS constrain_state (
+				theme TEXT PRIMARY KEY,
+				reason TEXT NOT NULL DEFAULT '',
+				fast_path INTEGER NOT NULL DEFAULT 0,
+				created_at INTEGER NOT NULL,
+				until_at INTEGER NOT NULL DEFAULT 0
+			);
+			CREATE INDEX IF NOT EXISTS idx_constrain_until
+				ON constrain_state(until_at);
+		`)
+		if err != nil {
+			return fmt.Errorf("migrate v3→v4: %w", err)
 		}
 	}
 	_, err := db.conn.Exec("UPDATE schema_meta SET version = ?", currentSchemaVersion)
