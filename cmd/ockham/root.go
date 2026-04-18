@@ -17,6 +17,7 @@ var haltAllowed = map[string]bool{
 	"discover": true, "discover scan": true,
 	"cost show": true, "cost check": true, "cost pending": true, "cost approve": true,
 	"route": true, "notify": true,
+	"weights": true, "weights show": true,
 	"help": true, "version": true,
 }
 
