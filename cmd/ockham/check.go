@@ -11,9 +11,14 @@ import (
 	"time"
 
 	"github.com/mistakeknot/Ockham/internal/anomaly"
+	"github.com/mistakeknot/Ockham/internal/constrain"
 	"github.com/mistakeknot/Ockham/internal/halt"
+	"github.com/mistakeknot/Ockham/internal/inflight"
+	"github.com/mistakeknot/Ockham/internal/interspect"
 	"github.com/mistakeknot/Ockham/internal/observation"
 	"github.com/mistakeknot/Ockham/internal/signals"
+	"github.com/mistakeknot/Ockham/internal/trigger"
+	"github.com/mistakeknot/Ockham/internal/writer"
 	"github.com/spf13/cobra"
 )
 
@@ -134,7 +139,71 @@ func (r *CheckRunner) evaluateSignals() error {
 		}
 	}
 
-	_ = state // pleasure signals are persisted by the evaluator
+	// Wave 2 trigger pipeline: translate each INFORM signal into a CONSTRAIN
+	// decision via F3/F4/F5/F6/F7/F8. Failures here are logged and do not
+	// fail the check — the flywheel degrades gracefully.
+	if err := r.runTriggerPipeline(state); err != nil {
+		fmt.Fprintf(os.Stderr, "ockham: trigger pipeline degraded: %v\n", err)
+	}
+
+	return nil
+}
+
+// runTriggerPipeline composes Wave 2 signal layers and processes each theme
+// signal through them. It is safe to call with an empty state — themes with
+// no data are skipped by the pipeline.
+func (r *CheckRunner) runTriggerPipeline(state anomaly.State) error {
+	pl, err := trigger.New(trigger.Config{
+		DB:         r.db,
+		Constrain:  constrain.New(r.db),
+		Confirm:    constrain.NewTrigger(r.db, constrain.DefaultConfirmPolicy()),
+		FastPath:   constrain.DefaultFastPathPolicy(),
+		Release:    constrain.NewReleaseController(r.db, constrain.DefaultStabilityPolicy()),
+		Interspect: interspect.NewChecker(interspect.NewReader(""), interspect.DefaultPolicy()),
+		InFlight:   inflight.New(inflight.PolicyFinishThenBlock),
+		Writer:     writer.New(r.db),
+	})
+	if err != nil {
+		return err
+	}
+
+	for theme, sig := range state.Signals {
+		// F4 fast path needs the drift delta between two consecutive windows.
+		// We track that separately from inform:<theme> (which the evaluator
+		// just overwrote) via prev_drift:<theme>. First-run themes see
+		// previous=0, so a single large drift fires fast-path — acceptable
+		// cold-start behavior since that state truly is a jump from unknown.
+		prev := 0.0
+		if raw, found, _ := r.db.GetSignalState("prev_drift:" + theme); found {
+			fmt.Sscanf(raw, "%f", &prev)
+		}
+		in := trigger.Input{
+			Theme:    theme,
+			Signal:   "drift",
+			Tripped:  sig.Status == anomaly.StatusFired,
+			Previous: prev,
+			Current:  sig.DriftPct,
+			Reason:   fmt.Sprintf("INFORM status=%s drift=%.1f%%", sig.Status, sig.DriftPct*100),
+		}
+		out, err := pl.OnSignal(in)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ockham: trigger pipeline theme=%q error: %v\n", theme, err)
+			continue
+		}
+		if out.Fired {
+			label := "confirmed"
+			if out.FastPath {
+				label = "fast_path"
+			}
+			fmt.Printf("  CONSTRAIN fired: theme=%s via=%s in_flight=%d\n", theme, label, out.InFlightCount)
+		}
+		if out.Released {
+			fmt.Printf("  CONSTRAIN released: theme=%s (stability streak met)\n", theme)
+		}
+
+		// Persist current drift for next cycle's fast-path comparison.
+		_ = r.db.SetSignalState("prev_drift:"+theme, fmt.Sprintf("%f", sig.DriftPct), time.Now().Unix())
+	}
 	return nil
 }
 
@@ -347,10 +416,10 @@ func (r *CheckRunner) reconstructHalt() error {
 
 	// Write sentinel — write-before-notify ordering
 	sentinel, _ := json.Marshal(map[string]any{
-		"reason":       record.Reason,
+		"reason":        record.Reason,
 		"reconstructed": true,
-		"source":       "interspect-halt-record",
-		"timestamp":    record.Timestamp,
+		"source":        "interspect-halt-record",
+		"timestamp":     record.Timestamp,
 	})
 
 	if err := os.MkdirAll(filepath.Dir(r.haltPath), 0755); err != nil {
