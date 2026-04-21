@@ -405,3 +405,88 @@ func indexBytes(haystack []byte, needle string) int {
 	}
 	return -1
 }
+
+// unknownVerdictChecker returns a checker whose evidence file does not exist,
+// so AgreesUnhealthy always returns VerdictUnknown.
+func unknownVerdictChecker(t *testing.T, dir string) *interspect.Checker {
+	t.Helper()
+	missing := filepath.Join(dir, "does-not-exist.json")
+	return interspect.NewChecker(interspect.NewReader(missing), interspect.Policy{
+		MaxStalenessSeconds: 3600,
+		MinPassRate:         0.5,
+		MinCategoryCount:    3,
+	})
+}
+
+// TestPipeline_UnknownVerdictBlocks_WhenConfigured verifies the strict-mode
+// knob: with UnknownVerdictBlocks=true, an Unknown verdict prevents fire.
+func TestPipeline_UnknownVerdictBlocks_WhenConfigured(t *testing.T) {
+	h := newHarness(t)
+	checker := unknownVerdictChecker(t, h.dir)
+
+	pl, err := trigger.New(trigger.Config{
+		DB:                   h.db,
+		Constrain:            constrain.New(h.db),
+		Confirm:              constrain.NewTrigger(h.db, constrain.ConfirmPolicy{RequiredWindows: 2}),
+		FastPath:             constrain.FastPathPolicy{Thresholds: map[string]float64{"drift": 0.30}},
+		Release:              constrain.NewReleaseController(h.db, constrain.StabilityPolicy{RequiredWindows: 2}),
+		Interspect:           checker,
+		Writer:               writer.New(h.db),
+		WeightsPath:          h.weightsPath,
+		UnknownVerdictBlocks: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fast-path-sized jump would normally fire; Unknown + strict mode blocks.
+	out, err := pl.OnSignal(trigger.Input{
+		Theme: "refactor", Signal: "drift",
+		Tripped: true, Previous: 0, Current: 0.50, Reason: "r",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Fired {
+		t.Errorf("strict Unknown should block fire, got Fired=true: %+v", out)
+	}
+	if out.InterspectVerdict != interspect.VerdictUnknown {
+		t.Errorf("verdict = %v, want Unknown", out.InterspectVerdict)
+	}
+}
+
+// TestPipeline_UnknownVerdictAllowsFire_Default verifies the permissive
+// default: UnknownVerdictBlocks=false → Unknown fails open, allowing fire.
+func TestPipeline_UnknownVerdictAllowsFire_Default(t *testing.T) {
+	h := newHarness(t)
+	checker := unknownVerdictChecker(t, h.dir)
+
+	pl, err := trigger.New(trigger.Config{
+		DB:          h.db,
+		Constrain:   constrain.New(h.db),
+		Confirm:     constrain.NewTrigger(h.db, constrain.ConfirmPolicy{RequiredWindows: 2}),
+		FastPath:    constrain.FastPathPolicy{Thresholds: map[string]float64{"drift": 0.30}},
+		Release:     constrain.NewReleaseController(h.db, constrain.StabilityPolicy{RequiredWindows: 2}),
+		Interspect:  checker,
+		Writer:      writer.New(h.db),
+		WeightsPath: h.weightsPath,
+		// UnknownVerdictBlocks intentionally omitted — default false.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pl.OnSignal(trigger.Input{
+		Theme: "refactor", Signal: "drift",
+		Tripped: true, Previous: 0, Current: 0.50, Reason: "r",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Fired {
+		t.Errorf("permissive Unknown should allow fire, got Fired=false: %+v", out)
+	}
+	if out.InterspectVerdict != interspect.VerdictUnknown {
+		t.Errorf("verdict = %v, want Unknown", out.InterspectVerdict)
+	}
+}

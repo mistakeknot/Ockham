@@ -22,17 +22,18 @@ import (
 // constr, confirm, fastPath, release, writer are optional — pass nil for
 // F5/F6 to skip those gates.
 type Pipeline struct {
-	db          *signals.DB
-	constr      *constrain.Controller
-	confirm     *constrain.Trigger
-	fastPath    constrain.FastPathPolicy
-	release     *constrain.ReleaseController
-	interspect  *interspect.Checker
-	inflight    *inflight.Controller
-	writer      *writer.Writer
-	weightsPath string
-	freezeFor   time.Duration
-	now         func() time.Time
+	db            *signals.DB
+	constr        *constrain.Controller
+	confirm       *constrain.Trigger
+	fastPath      constrain.FastPathPolicy
+	release       *constrain.ReleaseController
+	interspect    *interspect.Checker
+	inflight      *inflight.Controller
+	writer        *writer.Writer
+	weightsPath   string
+	freezeFor     time.Duration
+	unknownBlocks bool
+	now           func() time.Time
 }
 
 // Config bundles the dependencies a Pipeline needs to run.
@@ -51,6 +52,10 @@ type Config struct {
 	// FreezeFor is how long a CONSTRAIN lives by default. Zero means open-ended
 	// (explicit release required).
 	FreezeFor time.Duration
+	// UnknownVerdictBlocks, when true, treats interspect.VerdictUnknown as a
+	// block (same as VerdictHealthy). Default false preserves the permissive
+	// fail-open behavior: only explicit Healthy blocks a fire.
+	UnknownVerdictBlocks bool
 }
 
 // New constructs a Pipeline. The required dependencies (DB, Constrain, Confirm,
@@ -64,17 +69,18 @@ func New(cfg Config) (*Pipeline, error) {
 		wp = writer.DefaultPath()
 	}
 	return &Pipeline{
-		db:          cfg.DB,
-		constr:      cfg.Constrain,
-		confirm:     cfg.Confirm,
-		fastPath:    cfg.FastPath,
-		release:     cfg.Release,
-		interspect:  cfg.Interspect,
-		inflight:    cfg.InFlight,
-		writer:      cfg.Writer,
-		weightsPath: wp,
-		freezeFor:   cfg.FreezeFor,
-		now:         time.Now,
+		db:            cfg.DB,
+		constr:        cfg.Constrain,
+		confirm:       cfg.Confirm,
+		fastPath:      cfg.FastPath,
+		release:       cfg.Release,
+		interspect:    cfg.Interspect,
+		inflight:      cfg.InFlight,
+		writer:        cfg.Writer,
+		weightsPath:   wp,
+		freezeFor:     cfg.FreezeFor,
+		unknownBlocks: cfg.UnknownVerdictBlocks,
+		now:           time.Now,
 	}, nil
 }
 
@@ -170,8 +176,10 @@ func (p *Pipeline) handleTripped(in Input, active bool, out Outcome) (Outcome, e
 			verdict = interspect.VerdictUnknown
 		}
 		out.InterspectVerdict = verdict
-		if verdict == interspect.VerdictHealthy {
-			// Pairing blocks the fire — interspect disagrees.
+		if verdict == interspect.VerdictHealthy ||
+			(p.unknownBlocks && verdict == interspect.VerdictUnknown) {
+			// Pairing blocks the fire — interspect disagrees, or Unknown is
+			// configured to block (strict mode).
 			return out, nil
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,18 @@ type CheckRunner struct {
 	db       *signals.DB
 	haltPath string
 	dryRun   bool
+	// weightsPath overrides writer.DefaultPath() for the trigger pipeline.
+	// Empty means use the default. Tests set this to a temp file.
+	weightsPath string
+	// inflightCtl is an optional override for the F6 in-flight controller.
+	// Tests set this to nil (skip F6 entirely) or a fake-lister controller
+	// to avoid shelling to bd. Production leaves it nil and gets a default
+	// controller that shells to bd.
+	inflightCtl *inflight.Controller
+	// inflightOverride, when true, honors inflightCtl (including nil).
+	// Default false means runTriggerPipeline constructs the default
+	// bd-backed controller.
+	inflightOverride bool
 }
 
 func runCheck(cmd *cobra.Command, args []string) error {
@@ -153,15 +166,20 @@ func (r *CheckRunner) evaluateSignals() error {
 // signal through them. It is safe to call with an empty state — themes with
 // no data are skipped by the pipeline.
 func (r *CheckRunner) runTriggerPipeline(state anomaly.State) error {
+	inflightCtl := r.inflightCtl
+	if !r.inflightOverride {
+		inflightCtl = inflight.New(inflight.PolicyFinishThenBlock)
+	}
 	pl, err := trigger.New(trigger.Config{
-		DB:         r.db,
-		Constrain:  constrain.New(r.db),
-		Confirm:    constrain.NewTrigger(r.db, constrain.DefaultConfirmPolicy()),
-		FastPath:   constrain.DefaultFastPathPolicy(),
-		Release:    constrain.NewReleaseController(r.db, constrain.DefaultStabilityPolicy()),
-		Interspect: interspect.NewChecker(interspect.NewReader(""), interspect.DefaultPolicy()),
-		InFlight:   inflight.New(inflight.PolicyFinishThenBlock),
-		Writer:     writer.New(r.db),
+		DB:          r.db,
+		Constrain:   constrain.New(r.db),
+		Confirm:     constrain.NewTrigger(r.db, constrain.DefaultConfirmPolicy()),
+		FastPath:    constrain.DefaultFastPathPolicy(),
+		Release:     constrain.NewReleaseController(r.db, constrain.DefaultStabilityPolicy()),
+		Interspect:  interspect.NewChecker(interspect.NewReader(""), interspect.DefaultPolicy()),
+		InFlight:    inflightCtl,
+		Writer:      writer.New(r.db),
+		WeightsPath: r.weightsPath, // empty → trigger.New falls back to writer.DefaultPath()
 	})
 	if err != nil {
 		return err
@@ -175,11 +193,15 @@ func (r *CheckRunner) runTriggerPipeline(state anomaly.State) error {
 		// cold-start behavior since that state truly is a jump from unknown.
 		prev := 0.0
 		if raw, found, _ := r.db.GetSignalState("prev_drift:" + theme); found {
-			fmt.Sscanf(raw, "%f", &prev)
+			if p, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil {
+				prev = p
+			} else {
+				fmt.Fprintf(os.Stderr, "ockham: prev_drift parse degraded for %q: %v\n", theme, err)
+			}
 		}
 		in := trigger.Input{
 			Theme:    theme,
-			Signal:   "drift",
+			Signal:   "drift_pct", // must match constrain.DefaultFastPathPolicy key
 			Tripped:  sig.Status == anomaly.StatusFired,
 			Previous: prev,
 			Current:  sig.DriftPct,
